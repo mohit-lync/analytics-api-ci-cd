@@ -1,0 +1,99 @@
+name: Deploy to Amazon ECS
+
+on:
+  pull_request:
+    branches:
+      - unity-sdk
+    types: [closed]
+
+env:
+  ECS_TASK_DEFINITION: aws/task-definition.json # Path to your Amazon ECS task definition file
+  ECS_CONTAINER_NAME: ${{ secrets.ECS_CONTAINER_NAME }} # Name of the container in the task definition
+  ECS_SERVICE_NAME: ${{ secrets.ECS_SERVICE_NAME }} # Name of the ECS service
+  SECRETS_ID: ${{ secrets.SECRETS_ID }} # ARN of the AWS Secrets Manager secret
+  AWS_REGION: ${{ secrets.AWS_REGION }} # AWS region
+  ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY }} # Amazon ECR repository name
+  ECS_CLUSTER_NAME: ${{ secrets.ECS_CLUSTER_NAME }} # Amazon ECS cluster name
+  AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }} # AWS access key ID
+  AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }} # AWS secret access key
+
+jobs:
+  deploy:
+    if: github.event_name == 'pull_request' && github.event.action == 'closed' && github.event.pull_request.merged == true
+    name: Deploy
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          aws-access-key-id: ${{ env.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ env.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v1
+
+      - name: Get latest image tag
+        id: latest-image-tag
+        run: |
+          LATEST_TAG=$(aws ecr describe-images --repository-name ${{ env.ECR_REPOSITORY }} --query 'sort_by(imageDetails,& imagePushedAt)[-1].imageTags[0]' --output text)
+          if ! [[ $LATEST_TAG =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] ; then LATEST_TAG="1.0.0" ; fi
+          IFS='.' read -ra VERSION <<< "$LATEST_TAG"
+          PATCH=$((VERSION[2] + 1))
+          NEW_TAG="${VERSION[0]}.${VERSION[1]}.$PATCH"
+          echo "tag=$NEW_TAG" >> $GITHUB_OUTPUT
+
+      - name: Build, tag, and push image to Amazon ECR
+        id: build-image
+        run: |
+          ECR_REGISTRY=$(aws sts get-caller-identity --query 'Account' --output text).dkr.ecr.${{ ENV.AWS_REGION }}.amazonaws.com
+          IMAGE_TAG=${{ steps.latest-image-tag.outputs.tag }}
+          ECR_REPOSITORY=${{ ENV.ECR_REPOSITORY }}
+          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+          echo "image=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_OUTPUT
+
+      - name: Fill in the new image ID in the Amazon ECS task definition
+        id: task-def
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: ${{ env.ECS_TASK_DEFINITION }}
+          container-name: ${{ env.ECS_CONTAINER_NAME }}
+          image: ${{ steps.build-image.outputs.image }}
+
+      - name: Update task definition with environment variables
+        run: |
+          cp ${{ steps.task-def.outputs.task-definition }} updated-task-definition.json
+          secret_json=$(aws secretsmanager get-secret-value --secret-id $SECRETS_ID --query SecretString --output text)
+          secret_values=$(echo "$secret_json" | jq -r 'to_entries | map("\(.key)=\(.value | @json)") | .[]')
+          while IFS='=' read -r name value; do
+            if jq -e --arg name "$name" '.containerDefinitions[0].environment | any(.name == $name)' updated-task-definition.json > /dev/null; then
+              jq --arg name "$name" --argjson value "$value" '.containerDefinitions[0].environment |= map(if .name == $name then . + {"value": $value} else . end)' updated-task-definition.json > tmp.json && mv tmp.json updated-task-definition.json
+            else
+              jq --arg name "$name" --argjson value "$value" '.containerDefinitions[0].environment += [{"name": $name, "value": $value}]' updated-task-definition.json > tmp.json && mv tmp.json updated-task-definition.json
+            fi
+          done <<< "$secret_values"
+          aws ecs register-task-definition --cli-input-json file://updated-task-definition.json
+
+      - name: Stop running tasks
+        run: |
+          aws ecs list-tasks --cluster ${{ env.ECS_CLUSTER_NAME }} --service-name ${{ env.ECS_SERVICE_NAME }} --desired-status RUNNING --query 'taskArns[*]' --output text | while read -r taskArn
+          do
+            aws ecs stop-task --cluster ${{ env.ECS_CLUSTER_NAME }} --task $taskArn
+          done
+
+      - name: Deploy Amazon ECS task definition
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v1
+        with:
+          task-definition: ${{ steps.task-def.outputs.task-definition }}
+          service: ${{ env.ECS_SERVICE_NAME }}
+          cluster: ${{ env.ECS_CLUSTER_NAME }}
+          wait-for-service-stability: true
+
+      - name: Check ECS Service status
+        run: |
+          aws ecs describe-services --cluster ${{ env.ECS_CLUSTER_NAME }} --services ${{ env.ECS_SERVICE_NAME }} --query "services[0].{ServiceName:serviceName, Status:status, TaskDefinition:taskDefinition, DesiredCount:desiredCount, RunningCount:runningCount}"
