@@ -1,0 +1,34 @@
+{
+    "family": "analytics-api",
+    "containerDefinitions": [
+      {
+        "name": "test-cicd-api-analytics",
+        "image": "963832224664.dkr.ecr.us-east-1.amazonaws.com/test-cicd-api-analytics:latest",
+        "cpu": 0,
+        "portMappings": [
+          {
+            "name": "test-cicd-api-analytics",
+            "containerPort": 7410,
+            "hostPort": 7410,
+            "protocol": "tcp",
+            "appProtocol": "http"
+          }
+        ],
+        "essential": true,
+        "environment": [],
+        "environmentFiles": [],
+        "mountPoints": [],
+        "volumesFrom": [],
+        "ulimits": [],
+        "systemControls": []
+      }
+    ],
+    "executionRoleArn": "arn:aws:iam::963832224664:role/ecsTaskExecutionRole",
+    "requiresCompatibilities": ["EC2"],
+    "cpu": "1024",
+    "memory": "2048",
+    "runtimePlatform": {
+      "cpuArchitecture": "X86_64",
+      "operatingSystemFamily": "LINUX"
+    }
+  }
