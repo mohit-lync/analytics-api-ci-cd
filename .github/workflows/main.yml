@@ -1,0 +1,10 @@
+name: Deploy to Amazon ECS
+on: push
+  
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: first step
+        run: echo "pm"
+        
